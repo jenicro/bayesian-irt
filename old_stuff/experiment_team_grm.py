@@ -3,12 +3,24 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import cmdstanpy
 import os, glob
-import scipy.stats as st   # ✅ add this
+import scipy.stats as st
 import seaborn as sns
 
-# ------------------------------------------------------------
+# ============================================================
+# Project configuration
+# ============================================================
+PROJECT = "extremely_skewed_items"   # <<< CHANGE THIS PER PROJECT
+
+stan_file = "stan_files/laplace_grm.stan"
+output_dir = os.path.join("stan_output", PROJECT)
+plot_dir   = os.path.join("plots", PROJECT)
+
+os.makedirs(output_dir, exist_ok=True)
+os.makedirs(plot_dir, exist_ok=True)
+
+# ============================================================
 # Helper functions
-# ------------------------------------------------------------
+# ============================================================
 def logistic(x): return 1 / (1 + np.exp(-x))
 
 def grm_probs(theta, a, thresholds):
@@ -22,50 +34,39 @@ def simulate_response(theta, a, thresholds, rng):
     probs = grm_probs(np.array([theta]), a, thresholds)[0]
     return rng.choice(len(probs), p=probs) + 1
 
-# ------------------------------------------------------------
-# Item bank (20 items, fixed)
-# ------------------------------------------------------------
+# ============================================================
+# Item bank (example items)
+# ============================================================
 items = [
-    dict(a=1.2, thresholds=[-2.5,-1.5,-0.5,0.5,1.5,2.5]),
-    dict(a=0.9, thresholds=[-2.2,-1.2,-0.2,0.6,1.4,2.4]),
-    dict(a=1.5, thresholds=[-2.0,-1.0,0.0,1.0,2.0,3.0]),
-    dict(a=0.7, thresholds=[-2.8,-1.8,-0.8,0.2,1.0,1.8]),
-    dict(a=1.8, thresholds=[-2.3,-1.3,-0.5,0.7,1.5,2.3]),
-    dict(a=1.0, thresholds=[-2.6,-1.6,-0.6,0.4,1.2,2.0]),
-    dict(a=1.3, thresholds=[-2.1,-1.1,-0.3,0.5,1.3,2.1]),
-    dict(a=1.6, thresholds=[-2.4,-1.4,-0.4,0.6,1.4,2.4]),
-    #dict(a=0.8, thresholds=[-2.7,-1.7,-0.7,0.3,1.1,1.9]),
-    #dict(a=1.4, thresholds=[-2.2,-1.2,-0.2,0.8,1.6,2.5]),
-    #dict(a=1.1, thresholds=[-2.5,-1.5,-0.5,0.5,1.5,2.5]),
-    #dict(a=1.9, thresholds=[-2.0,-1.0,0.0,0.9,1.7,2.6]),
-    #dict(a=0.95, thresholds=[-2.3,-1.3,-0.3,0.7,1.5,2.2]),
-    #dict(a=1.25, thresholds=[-2.6,-1.6,-0.6,0.4,1.2,2.1]),
-    #dict(a=1.7, thresholds=[-2.1,-1.1,-0.1,0.9,1.7,2.7]),
-    #dict(a=0.85, thresholds=[-2.4,-1.4,-0.4,0.6,1.4,2.2]),
-    #dict(a=1.45, thresholds=[-2.2,-1.2,-0.2,0.8,1.6,2.4]),
-    #dict(a=1.6, thresholds=[-2.5,-1.5,-0.5,0.5,1.3,2.2]),
-    #dict(a=1.0, thresholds=[-2.3,-1.3,-0.3,0.7,1.5,2.3]),
-    #dict(a=1.8, thresholds=[-2.0,-1.0,0.0,1.0,2.0,3.0]),
+    dict(a=0.9, thresholds=[-4.37, -3.42, -2.56, -1.70, -0.86,  0.00]),
+    dict(a=1.2, thresholds=[-3.28, -2.57, -1.92, -1.29, -0.67, -0.07]),
+    dict(a=1.5, thresholds=[-2.62, -2.05, -1.51, -0.98, -0.47,  0.03]),
+    dict(a=0.7, thresholds=[-5.63, -4.38, -3.28, -2.21, -1.16, -0.14]),
+    dict(a=1.8, thresholds=[-2.19, -1.71, -1.25, -0.80, -0.36,  0.07]),
+    dict(a=1.0, thresholds=[-3.93, -3.08, -2.27, -1.48, -0.70,  0.05]),
+    dict(a=1.3, thresholds=[-2.90, -2.27, -1.65, -1.06, -0.48,  0.09]),
+    dict(a=1.6, thresholds=[-2.44, -1.92, -1.42, -0.93, -0.45,  0.03]),
 ]
 
-# ------------------------------------------------------------
+
+
+# ============================================================
 # Simulation setup
-# ------------------------------------------------------------
+# ============================================================
 rng = np.random.default_rng(42)
 
 L = 30           # number of teams
-J = len(items)    # items
-K = 7             # categories
+J = len(items)   # items
+K = 7            # categories
 
-# Draw team sizes uniformly between 10 and 30, for example
+# Team sizes uniformly between 5 and 20
 team_sizes = rng.integers(low=5, high=20, size=L)
 
-# True team thetas
-# variance split
+# Variance split
 var_teams = 0.25
 var_within = 0.75
-sigma_between = np.sqrt(var_teams)     # sqrt(0.25)
-sigma_within  = np.sqrt(var_within)  # sqrt(0.75)
+sigma_between = np.sqrt(var_teams)
+sigma_within  = np.sqrt(var_within)
 
 # Team-level means
 theta_team_true = rng.normal(0, sigma_between, L)
@@ -80,18 +81,7 @@ for t, n_members in enumerate(team_sizes):
 
 theta_ind = np.array(theta_ind)
 team_id   = np.array(team_id)
-
-# quick check
-print("Empirical mean:", theta_ind.mean())
-print("Empirical sd:", theta_ind.std())
-
-
-theta_ind = np.array(theta_ind)
-team_id   = np.array(team_id)
 N_ind     = len(theta_ind)
-
-print("Team sizes:", team_sizes)
-print("Total individuals:", N_ind)
 
 # Generate responses (long format)
 rows = []
@@ -101,7 +91,6 @@ for i in range(N_ind):
         rows.append((i+1, team_id[i], j+1, y))
 
 df = pd.DataFrame(rows, columns=["ind","leader","item","y"])
-print(df.head())
 
 # Stan long format inputs
 stan_data = dict(
@@ -114,23 +103,19 @@ stan_data = dict(
     y=df["y"].tolist()
 )
 
-# ------------------------------------------------------------
+# ============================================================
 # Fit or reload Stan
-# ------------------------------------------------------------
+# ============================================================
+model = cmdstanpy.CmdStanModel(stan_file=stan_file,
+                               model_name=f"laplace_grm_{PROJECT}")
 
-
-stan_file = "laplace_grm.stan"
-model = cmdstanpy.CmdStanModel(stan_file=stan_file)
-
-output_dir = "stan_output_team"
-os.makedirs(output_dir, exist_ok=True)
-csv_files = glob.glob(os.path.join(output_dir, "laplace_grm-*.csv"))
+csv_files = glob.glob(os.path.join(output_dir, f"laplace_grm_{PROJECT}-*.csv"))
 
 if csv_files:
-    print("🔄 Reloading existing Stan fit...")
+    print(f"🔄 Reloading existing Stan fit for {PROJECT}...")
     fit = cmdstanpy.from_csv(csv_files)
 else:
-    print("⚡ Running Stan fit...")
+    print(f"⚡ Running Stan fit for {PROJECT}...")
     fit = model.sample(
         data=stan_data,
         chains=4,
@@ -147,14 +132,7 @@ posterior = fit.draws_pd()
 # ============================================================
 # 2. Extract posterior medians for item params
 # ============================================================
-
-# -----------------
-# Data generator helpers (used after calibration)
-# -----------------
-def logistic(x):
-    return 1 / (1 + np.exp(-x))
-
-def grm_probs(theta, a, thresholds):
+def grm_probs_norm(theta, a, thresholds):
     K = len(thresholds) + 1
     cum = logistic(np.outer(theta, a) - a * thresholds)
     p_ge = np.concatenate([np.ones((theta.size,1)), cum, np.zeros((theta.size,1))], axis=1)
@@ -162,11 +140,10 @@ def grm_probs(theta, a, thresholds):
     return probs / probs.sum(axis=1, keepdims=True)
 
 def simulate_item(theta, a, thresholds, rng):
-    probs = grm_probs(theta, a, thresholds)
+    probs = grm_probs_norm(theta, a, thresholds)
     cum = np.cumsum(probs, axis=1)
     r = rng.random((theta.size,1))
     return (r > cum).sum(axis=1)  # returns 0..K-1
-
 
 a_hats, b_hats = [], []
 for j in range(1, J+1):
@@ -174,22 +151,22 @@ for j in range(1, J+1):
     cols = [c for c in posterior.columns if c.startswith(f"kappa[{j},")]
     cols = sorted(cols, key=lambda x: int(x.split(",")[1][:-1]))
     kappas = [posterior[c].median() for c in cols]
-    b_hat = [k / a_hat for k in kappas]   # probit thresholds -> divide by a
+    b_hat = [k / a_hat for k in kappas]
     a_hats.append(a_hat)
     b_hats.append(b_hat)
 
 calibrated_items = [dict(a=a, thresholds=np.array(b)) for a,b in zip(a_hats,b_hats)]
 
 # ============================================================
-# 3. Simulate *new* teams and individuals with variable sizes
+# 3. Simulate new teams and individuals with variable sizes
 # ============================================================
-team_sizes_new = rng.integers(low=5, high=30, size=L)   # e.g. 5–30 members
-theta_team_new = rng.normal(0, 0.5, L)
+team_sizes_new = rng.integers(low=5, high=20, size=L)
+theta_team_new = rng.normal(0, sigma_between, L)
 
 theta_ind_new = []
 team_id_new   = []
 for t, n_members in enumerate(team_sizes_new):
-    ind_theta = rng.normal(theta_team_new[t], 0.7, n_members)
+    ind_theta = rng.normal(theta_team_new[t], sigma_within, n_members)
     theta_ind_new.extend(ind_theta)
     team_id_new.extend([t] * n_members)
 
@@ -208,7 +185,7 @@ theta_grid = np.linspace(-3, 3, 121)
 def team_loglike(theta_val, responses, items):
     ll = 0.0
     for y_resp, it in zip(responses, items):
-        probs = grm_probs(np.array([theta_val]), it["a"], it["thresholds"])
+        probs = grm_probs_norm(np.array([theta_val]), it["a"], it["thresholds"])
         ll += np.log(probs[0, y_resp-1] + 1e-12)
     return ll
 
@@ -249,60 +226,156 @@ theta_ci_high = np.array(theta_ci_high)
 # ============================================================
 r = np.corrcoef(theta_team_new, theta_est_new)[0,1]
 rmse = np.sqrt(np.mean((theta_team_new - np.array(theta_est_new))**2))
-print(f"Bayesian ability recovery: r={r:.3f}, RMSE={rmse:.3f}")
-
-os.makedirs("plots", exist_ok=True)
+print(f"Bayesian ability recovery for {PROJECT}: r={r:.3f}, RMSE={rmse:.3f}")
 
 plt.figure(figsize=(8,8))
-# marker size proportional to sqrt(team size) so area ~ team size
 sizes = np.sqrt(team_sizes_new) * 20
 plt.errorbar(theta_team_new, theta_est_new,
              yerr=[theta_est_new-theta_ci_low, theta_ci_high-theta_est_new],
-             fmt='o', alpha=0.7, capsize=3, markersize=0)  # error bars only
+             fmt='o', alpha=0.7, capsize=3, markersize=0)
 plt.scatter(theta_team_new, theta_est_new,
             s=sizes, c=team_sizes_new, cmap="viridis", alpha=0.8, edgecolor="k")
 plt.colorbar(label="Team size")
 plt.plot([-3,3],[-3,3],'r--')
 plt.xlabel("True team θ")
 plt.ylabel("Posterior mean θ (fixed items)")
-plt.title("Team θ recovery with Bayesian updating\n(marker size/color = team size)")
+plt.title(f"Team θ recovery with Bayesian updating — {PROJECT}")
 plt.grid(True, linestyle="--", alpha=0.5)
-plt.savefig("plots/team_theta_recovery_bayes_sizes.png", dpi=150)
+plt.savefig(os.path.join(plot_dir, f"team_theta_recovery_bayes_sizes_{PROJECT}.png"), dpi=150)
 plt.close()
 
 # ============================================================
 # 6. Posterior density curves per team (exact)
 # ============================================================
-plt.figure(figsize=(12,6))   # wider figure
+plt.figure(figsize=(12,6))
 for t in range(L):
     probs = team_posterior(Y_new[team_id_new==t], calibrated_items, theta_grid, prior_sd=0.5)
     plt.plot(theta_grid, probs, label=f"Team {t} (n={team_sizes_new[t]})")
 
 plt.xlabel("θ")
 plt.ylabel("Posterior density")
-plt.title("Posterior of team θ (exact, fixed items)\n(n = team size)")
-
-# put legend outside, on the right
+plt.title(f"Posterior of team θ (exact, fixed items) — {PROJECT}\n(n = team size)")
 plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8, ncol=1, borderaxespad=0.)
-
 plt.tight_layout()
-plt.savefig("plots/team_theta_posteriors_exact_sizes.png", dpi=150, bbox_inches="tight")
+plt.savefig(os.path.join(plot_dir, f"team_theta_posteriors_exact_sizes_{PROJECT}.png"),
+            dpi=150, bbox_inches="tight")
 plt.close()
-
 
 # ============================================================
 # 7. Correlation between team size and uncertainty
 # ============================================================
 ci_widths = theta_ci_high - theta_ci_low
-
 cor_size_unc = np.corrcoef(team_sizes_new, ci_widths)[0,1]
-print(f"Correlation between team size and CI width: {cor_size_unc:.3f}")
+print(f"Correlation between team size and CI width ({PROJECT}): {cor_size_unc:.3f}")
 
 plt.figure(figsize=(7,5))
 plt.scatter(team_sizes_new, ci_widths, alpha=0.7)
 plt.xlabel("Team size (n)")
 plt.ylabel("95% CI width for θ")
-plt.title("Team size vs. posterior uncertainty")
+plt.title(f"Team size vs. posterior uncertainty — {PROJECT}")
 plt.grid(True, linestyle="--", alpha=0.5)
-plt.savefig("plots/team_size_vs_uncertainty.png", dpi=150)
+plt.savefig(os.path.join(plot_dir, f"team_size_vs_uncertainty_{PROJECT}.png"), dpi=150)
 plt.close()
+
+
+import seaborn as sns
+
+# Assume Y_new (N x J matrix) exists from your new simulation
+# Reshape to long format for plotting
+df_long = pd.DataFrame(Y_new, columns=[f"item{j+1}" for j in range(J)])
+df_long = df_long.melt(var_name="item", value_name="response")
+
+plt.figure(figsize=(12,6))
+sns.countplot(data=df_long, x="response", hue="item", palette="tab10")
+plt.xlabel("Response category")
+plt.ylabel("Count")
+plt.title(f"Distribution of observed categories across items — {PROJECT}")
+plt.legend(title="Item", bbox_to_anchor=(1.05,1), loc="upper left")
+plt.tight_layout()
+plt.savefig(os.path.join(plot_dir, f"category_frequencies_{PROJECT}.png"), dpi=150)
+plt.close()
+
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+
+
+def plot_team_caterpillar(theta_est, ci_low, ci_high, team_sizes, project, plot_dir,
+                          sort_desc=True, fname_prefix="team_caterpillar"):
+    """
+    Caterpillar plot of team-level posterior means with 95% CIs against a zero line.
+
+    Parameters
+    ----------
+    theta_est : array-like (L,)
+        Posterior mean (or median) theta per team.
+    ci_low, ci_high : array-like (L,)
+        Lower and upper 95% CI per team (same scale as theta_est).
+    team_sizes : array-like (L,)
+        Team sizes (n per team), used for sorting and coloring.
+    project : str
+        Project name for title/filename.
+    plot_dir : str
+        Directory to save the figure.
+    sort_desc : bool, default True
+        If True, sort by team size descending (largest at top).
+    fname_prefix : str
+        Prefix for the output filename.
+    """
+    theta_est = np.asarray(theta_est)
+    ci_low = np.asarray(ci_low)
+    ci_high = np.asarray(ci_high)
+    team_sizes = np.asarray(team_sizes)
+
+    # sort by team size
+    order = np.argsort(team_sizes)
+    if sort_desc:
+        order = order[::-1]
+
+    theta_ord = theta_est[order]
+    low_ord = ci_low[order]
+    high_ord = ci_high[order]
+    n_ord = team_sizes[order]
+    idx = np.arange(len(theta_ord))  # 0 .. L-1
+
+    os.makedirs(plot_dir, exist_ok=True)
+
+    plt.figure(figsize=(10, max(6, len(theta_ord) * 0.2)))  # auto height if many teams
+
+    # zero reference line
+    plt.axvline(0, color="red", linestyle="--", linewidth=1, alpha=0.9)
+
+    # horizontal error bars (CIs)
+    plt.hlines(idx, low_ord, high_ord, color="gray", alpha=0.7, linewidth=2)
+
+    # scatter points colored by team size
+    sc = plt.scatter(theta_ord, idx, c=n_ord, cmap="viridis", s=np.sqrt(n_ord) * 18,
+                     alpha=0.9, edgecolor="k")
+
+    cbar = plt.colorbar(sc)
+    cbar.set_label("Team size (n)")
+
+    # labels / title
+    plt.yticks(idx, [f"Team {i}" for i in order])  # show original team indices
+    plt.xlabel("Posterior mean θ (team)")
+    plt.ylabel("Teams (sorted by size)")
+    plt.title(f"Team posterior θ vs 0 (95% CI) — {project}")
+
+    plt.grid(axis="x", linestyle="--", alpha=0.4)
+    plt.tight_layout()
+
+    outpath = os.path.join(plot_dir, f"{fname_prefix}_{project}.png")
+    plt.savefig(outpath, dpi=150)
+    plt.close()
+    print(f"Saved: {outpath}")
+
+plot_team_caterpillar(
+    theta_est=theta_est_new,
+    ci_low=theta_ci_low,
+    ci_high=theta_ci_high,
+    team_sizes=team_sizes_new,
+    project=PROJECT,
+    plot_dir=plot_dir,
+    sort_desc=True,                         # largest teams at top
+    fname_prefix="team_posterior_caterpillar"
+)
