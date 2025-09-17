@@ -4,6 +4,9 @@ import numpy as np
 import arviz as az
 from cmdstanpy import CmdStanMCMC, CmdStanVB
 from pathlib import Path
+from bayesian_irt.plots import plot_forest_from_stats
+import xarray as xr
+import glob
 
 def expand_param_names(all_names, wanted):
     """
@@ -289,9 +292,112 @@ class StanModel:
         return az.plot_pair(self.idata, var_names=var_names, kind=kind)
 
     def extract(self, var_names=None):
-        """Extract draws as pandas DataFrame."""
-        return az.extract(self.idata, var_names=var_names).to_pandas()
+        """Extract draws"""
+        return az.extract(self.idata, var_names=var_names)
 
+    def get_point_estimates(self, var_names, statistic="mean"):
+        """
+        Return {var: numpy array of point estimates over posterior draws}
+        Works whether var_names is a str or a list, and whether az.extract
+        returns a DataArray (single var) or Dataset (multiple vars).
+        """
+
+        assert statistic in ("mean", "median")
+
+        # normalize var_names to a list
+        single = False
+        if isinstance(var_names, str):
+            var_names = [var_names]
+            single = True
+
+        ext = az.extract(self.idata, var_names=var_names)  # DataArray or Dataset
+
+        # wrap DataArray -> Dataset so we can index uniformly as data[var]
+        if isinstance(ext, xr.DataArray):
+            # If az.extract returned a DataArray, it corresponds to the single var requested
+            data = ext.to_dataset(name=var_names[0])
+        else:
+            data = ext
+
+        # detect the sampling dimension
+        if "sample" in data.dims:
+            sample_dim = "sample"
+        elif "draw" in data.dims:
+            sample_dim = "draw"
+        else:
+            # last resort: try to find a 1D dim whose length equals number of draws
+            # but it's better to raise clearly:
+            raise ValueError(f"Could not find a sample dimension in {list(data.dims)}")
+
+        out = {}
+        for var in var_names:
+            da = data[var]  # DataArray
+            if statistic == "mean":
+                out[var] = da.mean(dim=sample_dim).to_numpy()
+            else:  # median
+                out[var] = da.median(dim=sample_dim).to_numpy()
+
+        # if caller passed a single var name, return the bare array for convenience
+        if single:
+            return out[var_names[0]]
+        return out
+
+    def get_hdi(self, var_names, hdi_prob=0.95, split=True):
+        """
+        Return HDIs for one or many variables.
+
+        Parameters
+        ----------
+        var_names : str | list[str]
+            Variable name or list of names.
+        hdi_prob : float
+            Credible mass (e.g., 0.95).
+        split : bool
+            If True, return (lower, upper) tuple per var.
+            If False, return array stacked on last axis [..., 2].
+
+        Returns
+        -------
+        If a single var name was passed:
+            (lower, upper) arrays or stacked array (depending on `split`)
+        Else:
+            dict[var] -> (lower, upper) or stacked array
+        """
+        single = isinstance(var_names, str)
+        names = [var_names] if single else list(var_names)
+
+        res = az.hdi(self.idata, var_names=names, hdi_prob=hdi_prob)  # DataArray or Dataset
+
+        # Normalize to Dataset so `res[var]` always works
+        if isinstance(res, xr.DataArray):
+            res = res.to_dataset(name=names[0])
+
+        out = {}
+        for v in names:
+            da = res[v]  # DataArray with dims (..., hdi)
+            if "hdi" in da.dims:
+                # Try labeled selection first
+                if "hdi" in da.coords:
+                    labels = list(da.coords["hdi"].values.tolist())
+                else:
+                    labels = []
+
+                if "lower" in labels:
+                    lower = da.sel(hdi="lower").to_numpy()
+                    up_label = "upper" if "upper" in labels else ("higher" if "higher" in labels else None)
+                    upper = da.sel(hdi=up_label).to_numpy() if up_label else da.isel(hdi=1).to_numpy()
+                else:
+                    # Fallback: assume index 0=lower, 1=upper
+                    lower = da.isel(hdi=0).to_numpy()
+                    upper = da.isel(hdi=1).to_numpy()
+
+                out[v] = (lower, upper) if split else np.stack([lower, upper], axis=-1)
+            else:
+                # Unexpected, but pass through
+                arr = da.to_numpy()
+                out[v] = (arr, arr) if split else np.stack([arr, arr], axis=-1)
+
+        return out[names[0]] if single else out
 
     def _family_members(self, base):
         """
@@ -443,111 +549,119 @@ class StanModel:
         if show:
             plt.show()
 
+    import numpy as np
+    import matplotlib.pyplot as plt
+
     def plot_forest(self, base, hdi_prob=0.95, max_items=200, order="none",
                     true_values=None, figsize=(6, 8), ref_line=None):
         """
-        Forest plot for a parameter family (vector/matrix), showing mean and HDI.
-
-        Parameters
-        ----------
-        base : str
-            Family name, e.g. "mu_org" or "mu_team".
-        hdi_prob : float
-            HDI probability (e.g., 0.95).
-        max_items : int
-            Max number of items to plot (avoid gigantic figures).
-        order : {"none","mean","abs"}
-            Sort items by mean or absolute mean; "none" keeps natural order.
-        true_values : float | sequence[float] | None
-            Ground truth(s) to mark.
-              - scalar: vertical line at that value
-              - array-like: per-item markers (must match number of items)
-        figsize : tuple
-            Figure size.
-        ref_line : float | None
-            Draw a global reference vertical line (e.g., 0.0). Set None to disable.
+        Forest plot for a parameter family (vector or matrix), showing mean and HDI.
+        Supports both 1D families (classic forest) and 2D families (grouped forest).
+        Subsamples items if more than max_items exist.
         """
-        # ----- collect stats -----
-        if base in self.parameters:  # grouped param
-            arr = self.parameters[base]
-            sample_dims = tuple(d for d in arr.dims if d in ("chain", "draw"))
-            extra_dims = tuple(d for d in arr.dims if d not in ("chain", "draw"))
-            items = []
-            if not extra_dims:
-                vals = arr.values.ravel()
-                mean = float(np.mean(vals))
-                hdi = az.hdi(vals, hdi_prob=hdi_prob)
-                items.append((base, mean, float(hdi[0]), float(hdi[1])))
-            else:
-                shape = [arr.sizes[d] for d in extra_dims]
-                for idx_tuple in np.ndindex(*shape):
-                    sel = {extra_dims[i]: idx_tuple[i] for i in range(len(idx_tuple))}
-                    vals = arr.isel(**sel).values.ravel()
-                    mean = float(np.mean(vals))
-                    hdi = az.hdi(vals, hdi_prob=hdi_prob)
-                    label = f"{base}[{','.join(str(i + 1) for i in idx_tuple)}]"
-                    items.append((label, mean, float(hdi[0]), float(hdi[1])))
-        else:  # scalarized family
+
+        def _hdi_1d(samples: np.ndarray, mass: float = 0.95):
+            x = np.asarray(samples, float).ravel()
+            if x.size == 0:
+                return (np.nan, np.nan)
+            x.sort()
+            n = x.size
+            if n == 1:
+                return (x[0], x[0])
+            k = int(np.floor(mass * n))
+            if k < 1:
+                return (np.nan, np.nan)
+            widths = x[k:] - x[: n - k]
+            i = int(np.argmin(widths))
+            return float(x[i]), float(x[i + k])
+
+        if base not in self.parameters:
             members = self._family_members(base)
             if not members:
                 raise ValueError(f"Parameter family '{base}' not found.")
-            items = []
+            # scalarized family
+            items, labels = [], []
             for name, idx_tuple, da in members:
-                vals = da.values.ravel()
+                vals = da.values
                 mean = float(np.mean(vals))
-                hdi = az.hdi(vals, hdi_prob=hdi_prob)
-                items.append((name, mean, float(hdi[0]), float(hdi[1])))
+                lo, hi = _hdi_1d(vals, mass=hdi_prob)
+                labels.append(name)
+                items.append((mean, lo, hi))
+            means = np.array([m for m, _, _ in items], float)
+            lowers = np.array([lo for _, lo, _ in items], float)
+            uppers = np.array([hi for _, _, hi in items], float)
 
-        n = len(items)
-        if n > max_items:
-            raise ValueError(f"{base} has {n} elements; set max_items higher or subset indices.")
+        else:
+            arr = self.parameters[base]  # xarray.DataArray
+            sample_dims = [d for d in arr.dims if d in ("chain", "draw", "sample")]
+            param_dims = [d for d in arr.dims if d not in sample_dims]
+            values = arr.values
+            draws = int(np.prod([arr.sizes[d] for d in sample_dims]) or 1)
+            param_shape = tuple(arr.sizes[d] for d in param_dims)
+            values = values.reshape(draws, *param_shape)
 
-        # ----- ordering -----
-        if order == "mean":
-            items.sort(key=lambda x: x[1])
-        elif order == "abs":
-            items.sort(key=lambda x: abs(x[1]))
+            if len(param_shape) == 0:
+                # scalar
+                mean = float(values.mean())
+                lo, hi = _hdi_1d(values, mass=hdi_prob)
+                means, lowers, uppers = np.array([mean]), np.array([lo]), np.array([hi])
+                labels = [base]
 
-        labels = [it[0] for it in items]
-        means = np.array([it[1] for it in items])
-        lowers = np.array([it[2] for it in items])
-        uppers = np.array([it[3] for it in items])
+            elif len(param_shape) == 1:
+                # 1D case: (items,)
+                n_items = param_shape[0]
+                means = np.empty(n_items)
+                lowers = np.empty(n_items)
+                uppers = np.empty(n_items)
+                for i in range(n_items):
+                    s = values[:, i]
+                    means[i] = s.mean()
+                    lo, hi = _hdi_1d(s, mass=hdi_prob)
+                    lowers[i], uppers[i] = lo, hi
+                labels = [f"{base}[{i + 1}]" for i in range(n_items)]
 
-        y = np.arange(n)[::-1]
-
-        fig, ax = plt.subplots(figsize=figsize)
-
-        # HDIs
-        ax.hlines(y, lowers, uppers, linewidth=2)
-        # Means
-        ax.plot(means, y, "o", label="mean", color="C0")
-
-        # ----- global reference line -----
-        if ref_line is not None:
-            ax.axvline(ref_line, linestyle="--", linewidth=1, color="gray", label="ref")
-
-        # ----- true values -----
-        # ----- true values -----
-        if true_values is not None:
-            if np.isscalar(true_values):
-                ax.axvline(float(true_values), linestyle="-.", linewidth=1,
-                           color="red", label="true (scalar)")
+            elif len(param_shape) == 2:
+                # 2D case: (items, groups)
+                n_items, n_groups = param_shape
+                means = np.empty((n_items, n_groups))
+                lowers = np.empty((n_items, n_groups))
+                uppers = np.empty((n_items, n_groups))
+                for i in range(n_items):
+                    for g in range(n_groups):
+                        s = values[:, i, g]
+                        means[i, g] = s.mean()
+                        lo, hi = _hdi_1d(s, mass=hdi_prob)
+                        lowers[i, g], uppers[i, g] = lo, hi
+                labels = [f"{base}[{i + 1}]" for i in range(n_items)]
             else:
-                tv = np.asarray(true_values, dtype=float)
-                if tv.shape[0] != n:
-                    raise ValueError(f"true_values has length {tv.shape[0]} but {n} items were plotted.")
-                # Plot ticks instead of blobs
-                ax.plot(tv, y, marker="|", markersize=12, color="red",
-                        linestyle="None", label="true")
+                raise ValueError(f"Too many parameter dimensions for {base}: {param_shape}")
 
-        ax.set_yticks(y)
-        ax.set_yticklabels(labels)
-        ax.invert_yaxis()
-        ax.set_xlabel(base)
-        ax.set_title(f"{base} — mean and {int(hdi_prob * 100)}% HDI")
-        ax.legend(loc="best")
-        plt.tight_layout()
+        # ✅ Subsample if needed
+        total_items = means.shape[0]
+        if total_items > max_items:
+            idx = np.random.choice(total_items, max_items, replace=False)
+            means, lowers, uppers = means[idx], lowers[idx], uppers[idx]
+            labels = [labels[i] for i in idx]
+
+            # also adjust true_values if it's an array
+            if true_values is not None and not np.isscalar(true_values):
+                true_values = np.asarray(true_values)
+                if true_values.shape[0] == total_items:  # matches items
+                    true_values = true_values[idx]
+
+        # ✅ hand over to group-aware plotter
+        ax = plot_forest_from_stats(
+            means, lowers, uppers,
+            labels=labels,
+            order=order,
+            true_values=true_values,
+            ref_line=ref_line,
+            title=f"{base} — mean and {int(hdi_prob * 100)}% HDI",
+            xlabel=base,
+            figsize=figsize,
+        )
         plt.show()
+        return ax
 
     def get_draws(self, params, n=None, random=True):
         """
